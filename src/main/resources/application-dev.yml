@@ -1,0 +1,45 @@
+spring:
+  redis:
+    host: 192.168.5.137
+    port: 6379
+    password: 1234
+    lettuce:
+      pool:
+        min-idle: 1
+        max-idle: 10
+        max-active: 10
+        time-between-eviction-runs: 10s
+  cloud:
+    gateway:
+      httpclient:
+        pool:
+          max-idle-time: 3600000
+      redis-route-definition-repository:
+        enabled: true
+#      routes:
+#        - id: user-service
+#          uri: http://localhost:8082
+#          predicates:
+#            - Path=/cams/user/info,/cams/user/add
+#          filters:
+#            - StripPrefix=1
+
+dubbo:
+  application:
+    name: dubbo-springboot-consumer
+    qos-enable: true
+    qos-port: 33333
+    qos-accept-foreign-ip: false
+  registry:
+    address: zookeeper://192.168.5.137:2181
+    timeout: 60000
+    parameters:
+      blockUntilConnectedWait: 250
+
+
+logging:
+  level:
+    org:
+      springframework:
+        cloud:
+          gateway: trace

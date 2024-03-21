@@ -5,6 +5,7 @@ import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import com.zhenwu.api.model.RequestData;
 import com.zhenwu.api.model.RequestInfo;
+import com.zhenwu.common.entity.InnerApiTransferApiInvokeLog;
 import com.zhenwu.common.entity.InnerApiTransferInterfaceInfo;
 import com.zhenwu.common.entity.InnerApiTransferUser;
 import com.zhenwu.common.service.InnerApiInterfaceInfoService;
@@ -16,18 +17,11 @@ import org.apache.dubbo.config.annotation.DubboReference;
 import org.reactivestreams.Publisher;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
-import org.springframework.cloud.gateway.handler.predicate.PredicateDefinition;
-import org.springframework.cloud.gateway.route.Route;
-import org.springframework.cloud.gateway.route.RouteDefinition;
-import org.springframework.cloud.gateway.route.builder.RouteLocatorBuilder;
-import org.springframework.cloud.gateway.support.ServerWebExchangeUtils;
 import org.springframework.core.Ordered;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferFactory;
 import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.core.io.buffer.DefaultDataBufferFactory;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.server.reactive.ServerHttpRequest;
@@ -35,8 +29,7 @@ import org.springframework.http.server.reactive.ServerHttpRequestDecorator;
 import org.springframework.http.server.reactive.ServerHttpResponse;
 import org.springframework.http.server.reactive.ServerHttpResponseDecorator;
 import org.springframework.stereotype.Component;
-import org.springframework.util.MultiValueMap;
-import org.springframework.util.StringUtils;
+import org.springframework.util.StopWatch;
 import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.util.UriComponentsBuilder;
 import reactor.core.publisher.Flux;
@@ -69,28 +62,27 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
 
-        log.info("[1]attributes = {}", exchange.getAttributes());
-        Route route = exchange.getAttribute(ServerWebExchangeUtils.GATEWAY_ROUTE_ATTR);
-        if (route != null) {
-            log.info("The gatewayRoute of class: {}", route.getClass().getName());
-        }
+        ServerHttpRequest request = exchange.getRequest();
+        ServerHttpResponse response = exchange.getResponse();
+        StopWatch stopWatch = new StopWatch();
 
-        // 获取请求信息，并记录请求日志
+        // 1.获取请求信息，并记录请求日志
         Map<String, Object> attributes = exchange.getAttributes();
         String requestBody = (String) attributes.get("requestBody");
         attributes.remove("requestBody");
         log.info("requestBody = {}", requestBody);
         RequestInfo requestInfo = this.verifyAndExtractInfo(requestBody);
         if (requestInfo == null) {
-            return Mono.empty();
+            response.setStatusCode(HttpStatus.BAD_REQUEST);
+            response.getHeaders().add("Content-Type", "application/json");
+            String errorMessage = "{\"error\": \"Bad Request!\"}";
+            return response.writeWith(Mono.just(response.bufferFactory().wrap(errorMessage.getBytes())));
         }
         log.info("extract data = {}", requestInfo);
 
-        ServerHttpRequest request = exchange.getRequest();
-        ServerHttpResponse response = exchange.getResponse();
         InnerApiTransferInterfaceInfo innerApiTransferInterfaceInfo = requestInfo.getInnerApiTransferInterfaceInfo();
         InnerApiTransferUser innerApiTransferUser = requestInfo.getInnerApiTransferUser();
-        // 查询用户调用次数是否充足
+        // 2.查询用户调用次数是否充足
         int leftInvokeNum = this.innerApiUserInterfaceInfoService.queryLeftInvokeNum(innerApiTransferInterfaceInfo.getId(), innerApiTransferUser.getId());
         if (leftInvokeNum < 1) {
             response.setStatusCode(HttpStatus.OK);
@@ -99,25 +91,34 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
             return response.writeWith(Mono.just(response.bufferFactory().wrap(errorMessage.getBytes())));
         }
 
-        ServerHttpRequest newRequest = handleRequest(request, innerApiTransferInterfaceInfo, requestInfo.getRequestData().getInterfaceData());
-        // 获取响应对象
+        ServerHttpRequest newRequest = mutateRequest(request, innerApiTransferInterfaceInfo, requestInfo.getRequestData().getInterfaceData());
+        // 3.获取响应对象
         DataBufferFactory bufferFactory = response.bufferFactory();
         ServerHttpResponseDecorator responseDecorator = new ServerHttpResponseDecorator(response) {
             @Override
             public Mono<Void> writeWith(Publisher<? extends DataBuffer> body) {
                 HttpStatus statusCode = getStatusCode();
-                log.info("statusCode = {}", statusCode);
-                if (HttpStatus.OK.equals(statusCode) && body instanceof Flux) {
+                stopWatch.stop();
+                Long interfaceInfoId = innerApiTransferInterfaceInfo.getId();
+                Long userId = innerApiTransferUser.getId();
 
+                InnerApiTransferApiInvokeLog innerApiTransferApiInvokeLog = new InnerApiTransferApiInvokeLog();
+                innerApiTransferApiInvokeLog.setUserId(userId);
+                innerApiTransferApiInvokeLog.setInterfaceInfoId(interfaceInfoId);
+                innerApiTransferApiInvokeLog.setResponseStatus(statusCode == null ? 500 : statusCode.value());
+                innerApiTransferApiInvokeLog.setCostTime((int) stopWatch.getTotalTimeMillis());
+                innerApiTransferApiInvokeLog.setRequestParameter(requestInfo.getRequestData().getInterfaceData());
+
+                if (HttpStatus.OK.equals(statusCode) && body instanceof Flux) {
                     // 响应成功，减少调用次数
-                    boolean result = innerApiUserInterfaceInfoService.invokeCount(innerApiTransferInterfaceInfo.getId(), innerApiTransferUser.getId());
-                    log.info("result = {}", result);
+                    boolean invokeCountResult = innerApiUserInterfaceInfoService.invokeCount(interfaceInfoId, userId);
+                    log.info("invokeCountResult = {}", invokeCountResult);
 
                     // 获取响应 ContentType
                     String responseContentType = exchange.getAttribute(ORIGINAL_RESPONSE_CONTENT_TYPE_ATTR);
                     log.info("responseContentType= {}", responseContentType);
                     // 记录 JSON 格式数据的响应体
-                    if (!StringUtils.isEmpty(responseContentType) && responseContentType.contains(MediaType.APPLICATION_JSON_VALUE)) {
+                    if (!StrUtil.isEmpty(responseContentType) && responseContentType.contains(MediaType.APPLICATION_JSON_VALUE)) {
                         Flux<? extends DataBuffer> fluxBody = Flux.from(body);
                         // 解决返回体分段传输
                         return super.writeWith(fluxBody.buffer().map(dataBuffers -> {
@@ -129,23 +130,26 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
                                 list.add(new String(content, StandardCharsets.UTF_8));
                             });
                             log.info("响应数据:{}", list);
-                            String responseData = "{\"name\":\"jack\"}";
-                            log.info("<------------------------ RESPONSE RESULT = [{}]", responseData.replaceAll("\n","").replaceAll("\t",""));
-                            return bufferFactory.wrap(responseData.getBytes());
+                            boolean insertInvokeLogResult = innerApiUserInterfaceInfoService.insertInvokeLog(innerApiTransferApiInvokeLog);
+                            log.info("insertInvokeLogResult = {}", insertInvokeLogResult);
+                            return bufferFactory.wrap(list.toString().getBytes());
                         }));
                     }
                 }
                 log.info("body = {}", body);
+                // 记录接口响应日志
+                boolean insertInvokeLogResult = innerApiUserInterfaceInfoService.insertInvokeLog(innerApiTransferApiInvokeLog);
+                log.info("insertInvokeLogResult = {}", insertInvokeLogResult);
                 return super.writeWith(body);
             }
         };
 
+        stopWatch.start();
         ServerWebExchange mutatedExchange = exchange.mutate()
                 .request(newRequest)
                 .response(responseDecorator)
                 .build();
-
-        log.info("[2]attributes = {}", mutatedExchange.getAttributes());
+        
         return chain.filter(mutatedExchange);
     }
 
@@ -155,7 +159,14 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
         return -2;
     }
 
-    private ServerHttpRequest handleRequest(ServerHttpRequest request, InnerApiTransferInterfaceInfo innerApiTransferInterfaceInfo, String interfaceData) {
+    /**
+     * 根据接口信息重新构造请求对象
+     * @param request 原始请求
+     * @param innerApiTransferInterfaceInfo 接口信息
+     * @param interfaceData 接口数据
+     * @return 符合接口要求的新请求对象
+     */
+    private ServerHttpRequest mutateRequest(ServerHttpRequest request, InnerApiTransferInterfaceInfo innerApiTransferInterfaceInfo, String interfaceData) {
         String interfaceRequestMethod = innerApiTransferInterfaceInfo.getInterfaceRequestMethod();
         ServerHttpRequest newRequest = null;
         switch (interfaceRequestMethod) {
@@ -226,7 +237,7 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
             return null;
         }
 
-        // 查询用户信息
+        // 1.查询用户信息
         InnerApiTransferUser innerApiTransferUser = this.innerApiUserService.getUserInfo(accessKey);
         if (innerApiTransferUser == null) {
             // 未查询到用户信息
@@ -234,11 +245,22 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
             return null;
         }
 
-        String decryptData = CommonUtils.decrypt(data, innerApiTransferUser.getUserPrivatekey());
-        // TODO 数据解析失败
+        // 2.判断用户状态是否正常
+        if (!new Integer(0).equals(innerApiTransferUser.getUserStatus())) {
+            log.error("用户{}的状态不正常", accessKey);
+            return null;
+        }
+
+        String decryptData;
+        try {
+            decryptData = CommonUtils.decrypt(data, innerApiTransferUser.getUserPrivatekey());
+        } catch (Exception e) {
+            log.error("数据解析失败", e);
+            return null;
+        }
         RequestData requestData = JSONUtil.toBean(decryptData, RequestData.class);
 
-        // 验证签名
+        // 3.验证签名
         String userSign = requestData.getSign();
         String interfaceToken = requestData.getInterfaceToken();
         String sign = requestData.getInterfaceData() == null ?
@@ -249,14 +271,14 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
             return null;
         }
 
-        // 查询接口信息
+        // 4.查询接口信息
         InnerApiTransferInterfaceInfo innerApiTransferInterfaceInfo = this.innerApiInterfaceInfoService.getInterfaceInfo(interfaceToken);
         if (innerApiTransferInterfaceInfo == null) {
             log.error("未查询到{}的用户访问的接口{}信息", accessKey, interfaceToken);
             return null;
         }
 
-        // 判读接口状态
+        // 5.判读接口状态
         if (0 == innerApiTransferInterfaceInfo.getInterfaceStatus() || 0 == innerApiTransferInterfaceInfo.getInterfaceDelete()) {
             log.error("用户{}访问的接口{}已下线或已删除", accessKey, interfaceToken);
             return null;
