@@ -15,6 +15,7 @@ import com.zhenwu.common.util.CommonUtils;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.reactivestreams.Publisher;
+import org.slf4j.MDC;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
@@ -35,6 +36,7 @@ import org.springframework.web.util.UriComponentsBuilder;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -49,6 +51,10 @@ import static org.springframework.cloud.gateway.support.ServerWebExchangeUtils.O
 @Slf4j
 @Component
 public class CustomGlobalFilter implements GlobalFilter, Ordered {
+
+    private static final String USER_ACCESS_KEY = "userAccesskey";
+
+    private static final String REQUEST_INTERFACE_ID = "requestInterfaceId";
 
     @DubboReference
     private InnerApiUserService innerApiUserService;
@@ -82,6 +88,9 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
 
         InnerApiTransferInterfaceInfo innerApiTransferInterfaceInfo = requestInfo.getInnerApiTransferInterfaceInfo();
         InnerApiTransferUser innerApiTransferUser = requestInfo.getInnerApiTransferUser();
+        MDC.put(USER_ACCESS_KEY, innerApiTransferUser.getUserAccesskey());
+        MDC.put(REQUEST_INTERFACE_ID, innerApiTransferInterfaceInfo.getId().toString());
+
         // 2.查询用户调用次数是否充足
         int leftInvokeNum = this.innerApiUserInterfaceInfoService.queryLeftInvokeNum(innerApiTransferInterfaceInfo.getId(), innerApiTransferUser.getId());
         if (leftInvokeNum < 1) {
@@ -105,6 +114,10 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
                 InnerApiTransferApiInvokeLog innerApiTransferApiInvokeLog = new InnerApiTransferApiInvokeLog();
                 innerApiTransferApiInvokeLog.setUserId(userId);
                 innerApiTransferApiInvokeLog.setInterfaceInfoId(interfaceInfoId);
+                InetSocketAddress requestRemoteAddress = request.getRemoteAddress();
+                if (requestRemoteAddress != null) {
+                    innerApiTransferApiInvokeLog.setRequestIp(requestRemoteAddress.toString());
+                }
                 innerApiTransferApiInvokeLog.setResponseStatus(statusCode == null ? 500 : statusCode.value());
                 innerApiTransferApiInvokeLog.setCostTime((int) stopWatch.getTotalTimeMillis());
                 innerApiTransferApiInvokeLog.setRequestParameter(requestInfo.getRequestData().getInterfaceData());
@@ -132,6 +145,8 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
                             log.info("响应数据:{}", list);
                             boolean insertInvokeLogResult = innerApiUserInterfaceInfoService.insertInvokeLog(innerApiTransferApiInvokeLog);
                             log.info("insertInvokeLogResult = {}", insertInvokeLogResult);
+                            MDC.remove(USER_ACCESS_KEY);
+                            MDC.remove(REQUEST_INTERFACE_ID);
                             return bufferFactory.wrap(list.toString().getBytes());
                         }));
                     }
@@ -140,6 +155,8 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
                 // 记录接口响应日志
                 boolean insertInvokeLogResult = innerApiUserInterfaceInfoService.insertInvokeLog(innerApiTransferApiInvokeLog);
                 log.info("insertInvokeLogResult = {}", insertInvokeLogResult);
+                MDC.remove(USER_ACCESS_KEY);
+                MDC.remove(REQUEST_INTERFACE_ID);
                 return super.writeWith(body);
             }
         };
